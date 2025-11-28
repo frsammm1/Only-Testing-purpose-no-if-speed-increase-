@@ -4,7 +4,7 @@ import logging
 import time
 import math
 import re
-import mimetypes  # <--- Added for Smart Detection
+import mimetypes
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, MessageNotModifiedError
@@ -23,9 +23,23 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- CLIENT SETUP ---
-# Optimized connection settings
-user_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH, connection_retries=None, flood_sleep_threshold=60)
-bot_client = TelegramClient('bot_session', API_ID, API_HASH, connection_retries=None, flood_sleep_threshold=60)
+# Connection Pool Badha Diya Hai
+user_client = TelegramClient(
+    StringSession(STRING_SESSION), 
+    API_ID, 
+    API_HASH, 
+    connection_retries=None, 
+    flood_sleep_threshold=60,
+    request_retries=10
+)
+bot_client = TelegramClient(
+    'bot_session', 
+    API_ID, 
+    API_HASH, 
+    connection_retries=None, 
+    flood_sleep_threshold=60,
+    request_retries=10
+)
 
 # --- GLOBAL STATE ---
 pending_requests = {} 
@@ -36,7 +50,7 @@ last_update_time = 0
 
 # --- WEB SERVER ---
 async def handle(request):
-    return web.Response(text="Bot is Running (Smart Type & 8MB Speed)! 🟢")
+    return web.Response(text="Bot is Running (Queue Turbo)! 🔥")
 
 async def start_web_server():
     app = web.Application()
@@ -67,8 +81,7 @@ async def progress_callback(current, total, start_time, file_name):
     global last_update_time, status_message
     now = time.time()
     
-    # Update every 5 seconds
-    if now - last_update_time < 5: return 
+    if now - last_update_time < 4: return # Faster updates
     last_update_time = now
     
     percentage = current * 100 / total if total > 0 else 0
@@ -81,16 +94,16 @@ async def progress_callback(current, total, start_time, file_name):
     
     try:
         await status_message.edit(
-            f"🚀 **High Speed Transfer...**\n"
+            f"⚡️ **Turbo Transfer...**\n"
             f"📂 `{file_name}`\n"
             f"**{bar} {round(percentage, 1)}%**\n"
-            f"⚡️ `{human_readable_size(speed)}/s` | ⏳ `{time_formatter(eta)}`\n"
+            f"🚀 `{human_readable_size(speed)}/s` | ⏳ `{time_formatter(eta)}`\n"
             f"💾 `{human_readable_size(current)} / {human_readable_size(total)}`"
         )
     except Exception: pass
 
-# --- CUSTOM FILE CLASS (8MB CHUNKS) ---
-class CustomStreamFile:
+# --- PARALLEL QUEUE STREAM (THE SPEED BEAST) ---
+class ParallelQueueStream:
     def __init__(self, client, location, file_size, file_name, start_time):
         self.client = client
         self.location = location
@@ -99,43 +112,55 @@ class CustomStreamFile:
         self.start_time = start_time
         self.current_bytes = 0
         
-        # SPEED UPGRADE: 8MB Chunks (Maximum allowed by Telegram for Parts)
-        # This reduces overhead and maximizes throughput
+        # 8MB Ultra Chunks
         self.chunk_size = 8 * 1024 * 1024 
-        self.generator = client.iter_download(location, chunk_size=self.chunk_size)
+        
+        # Queue System: 3 Chunks (24MB) Advance Buffer in RAM
+        self.queue = asyncio.Queue(maxsize=3)
+        self.downloader_task = asyncio.create_task(self._worker())
         self.buffer = b""
+
+    async def _worker(self):
+        """Background worker that fetches chunks aggressively"""
+        try:
+            # iter_download with 8MB chunks
+            async for chunk in self.client.iter_download(self.location, chunk_size=self.chunk_size):
+                await self.queue.put(chunk)
+            await self.queue.put(None) # EOF Signal
+        except Exception as e:
+            logger.error(f"Worker Error: {e}")
+            await self.queue.put(None)
 
     def __len__(self):
         return self.file_size
 
     async def read(self, size=-1):
+        # We ignore 'size' request and feed whatever is in buffer for max speed
         if size == -1: size = self.chunk_size
         
         while len(self.buffer) < size:
-            try:
-                chunk = await self.generator.__anext__()
-                if not chunk: break 
-                self.buffer += chunk
-                self.current_bytes += len(chunk)
+            chunk = await self.queue.get()
+            
+            if chunk is None: # EOF
+                await self.queue.put(None) # Keep None for next calls
+                break
                 
-                # Non-blocking progress update
-                asyncio.create_task(progress_callback(self.current_bytes, self.file_size, self.start_time, self.name))
-            except StopAsyncIteration:
-                break
-            except Exception as e:
-                logger.error(f"Download Error: {e}")
-                break
-        
+            self.buffer += chunk
+            self.current_bytes += len(chunk)
+            
+            # Non-blocking Progress
+            asyncio.create_task(progress_callback(self.current_bytes, self.file_size, self.start_time, self.name))
+
         data = self.buffer[:size]
         self.buffer = self.buffer[size:]
         return data
 
-# --- SMART ATTRIBUTE CLEANER ---
-def get_clean_attributes(message, fixed_file_name):
+# --- SMART ATTRIBUTE & NAME FIXER ---
+def get_clean_attributes(message, original_filename):
     attributes = []
     
     # 1. Force The Correct Filename
-    attributes.append(DocumentAttributeFilename(file_name=fixed_file_name))
+    attributes.append(DocumentAttributeFilename(file_name=original_filename))
     
     # 2. Preserve Video Metadata
     if message.media and hasattr(message.media, 'document'):
@@ -146,11 +171,40 @@ def get_clean_attributes(message, fixed_file_name):
                     w=attr.w,
                     h=attr.h,
                     round_message=attr.round_message,
-                    supports_streaming=True # Crucial for Video Player
+                    supports_streaming=True
                 ))
             elif isinstance(attr, DocumentAttributeAudio):
                 attributes.append(attr)
     return attributes
+
+# --- FILE INFO INTELLIGENCE ---
+def get_file_info(message):
+    file_name = "Unknown_File"
+    mime_type = "application/octet-stream"
+    
+    if message.file:
+        mime_type = message.file.mime_type
+        
+        # Priority 1: Original Name
+        if message.file.name:
+            file_name = message.file.name
+        else:
+            # Priority 2: Guess from MIME
+            ext = mimetypes.guess_extension(mime_type)
+            if not ext:
+                if "video" in mime_type: ext = ".mp4"
+                elif "image" in mime_type: ext = ".jpg"
+                elif "pdf" in mime_type: ext = ".pdf"
+                else: ext = ""
+            file_name = f"File_{message.id}{ext}"
+            
+    # CRITICAL FIX: Add extension if missing but mime implies video
+    if "video" in mime_type and not re.search(r'\.(mp4|mkv|avi|mov|webm)$', file_name, re.IGNORECASE):
+        file_name += ".mp4"
+    elif "pdf" in mime_type and not file_name.lower().endswith(".pdf"):
+        file_name += ".pdf"
+        
+    return file_name, mime_type
 
 # --- LINK PARSER ---
 def extract_id_from_link(link):
@@ -159,37 +213,11 @@ def extract_id_from_link(link):
     if match: return int(match.group(1))
     return None
 
-# --- FILE TYPE DETECTOR ---
-def get_file_info(message):
-    file_name = "Unknown_File"
-    mime_type = "application/octet-stream"
-    
-    if message.file:
-        mime_type = message.file.mime_type
-        if message.file.name:
-            file_name = message.file.name
-        else:
-            # GUESS EXTENSION if missing
-            ext = mimetypes.guess_extension(mime_type)
-            if not ext:
-                if "video" in mime_type: ext = ".mp4"
-                elif "image" in mime_type: ext = ".jpg"
-                elif "audio" in mime_type: ext = ".mp3"
-                elif "pdf" in mime_type: ext = ".pdf"
-                else: ext = ""
-            file_name = f"File_{message.id}{ext}"
-    
-    # Fix: Ensure video files have extension
-    if "video" in mime_type and not file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov')):
-        file_name += ".mp4"
-        
-    return file_name, mime_type
-
 # --- TRANSFER PROCESS ---
 async def transfer_process(event, source_id, dest_id, start_msg, end_msg):
     global is_running, status_message
     
-    status_message = await event.respond(f"🚀 **Max Speed Engine Started!**\nSource: `{source_id}`")
+    status_message = await event.respond(f"🔥 **Queue Engine Started!**\nSource: `{source_id}`")
     total_processed = 0
     
     try:
@@ -201,7 +229,7 @@ async def transfer_process(event, source_id, dest_id, start_msg, end_msg):
             if getattr(message, 'action', None): continue
 
             try:
-                # --- SMART FILE DETECTION ---
+                # 1. Smart Detection
                 file_name, mime_type = get_file_info(message)
                 await status_message.edit(f"🔍 **Processing:** `{file_name}`")
 
@@ -211,7 +239,7 @@ async def transfer_process(event, source_id, dest_id, start_msg, end_msg):
                     sent = False
                     start_time = time.time()
                     
-                    # 1. DIRECT COPY (Try First)
+                    # 2. Direct Copy (Try First)
                     try:
                         await bot_client.send_file(dest_id, message.media, caption=message.text or "")
                         sent = True
@@ -219,12 +247,12 @@ async def transfer_process(event, source_id, dest_id, start_msg, end_msg):
                     except Exception:
                         pass 
 
-                    # 2. STREAM MODE (With Fixes)
+                    # 3. Queue Stream Mode (Max Speed)
                     if not sent:
                         attributes = get_clean_attributes(message, file_name)
                         thumb = await user_client.download_media(message, thumb=-1)
                         
-                        stream_file = CustomStreamFile(
+                        stream_file = ParallelQueueStream(
                             user_client, 
                             message.media.document if hasattr(message.media, 'document') else message.media.photo,
                             message.file.size,
@@ -232,12 +260,12 @@ async def transfer_process(event, source_id, dest_id, start_msg, end_msg):
                             start_time
                         )
                         
-                        # Decide if it should be sent as 'File' or 'Media'
-                        force_document = False
+                        # Display Logic
+                        force_doc = False
                         if "video" in mime_type or "image" in mime_type:
-                            force_document = False # Show in Gallery/Player
+                            force_doc = False
                         else:
-                            force_document = True # Show as File
+                            force_doc = True
                         
                         await bot_client.send_file(
                             dest_id,
@@ -247,7 +275,7 @@ async def transfer_process(event, source_id, dest_id, start_msg, end_msg):
                             thumb=thumb,
                             supports_streaming=True,
                             file_size=message.file.size,
-                            force_document=force_document,
+                            force_document=force_doc,
                             mime_type=mime_type
                         )
                         
@@ -268,19 +296,19 @@ async def transfer_process(event, source_id, dest_id, start_msg, end_msg):
             await status_message.edit(f"✅ **Task Completed!**\nTotal Messages: `{total_processed}`")
 
     except Exception as e:
-        await status_message.edit(f"❌ **Critical Error:** {e}")
+        await status_message.edit(f"❌ **Error:** {e}")
     finally:
         is_running = False
 
 # --- COMMANDS ---
 @bot_client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
-    await event.respond("🟢 **Bot Ready!**\n`/clone Source Dest`")
+    await event.respond("🟢 **Turbo Bot Ready!**\n`/clone Source Dest`")
 
 @bot_client.on(events.NewMessage(pattern='/clone'))
 async def clone_init(event):
     global is_running
-    if is_running: return await event.respond("⚠️ Task Running...")
+    if is_running: return await event.respond("⚠️ Busy...")
     try:
         args = event.text.split()
         pending_requests[event.chat_id] = {'source': int(args[1]), 'dest': int(args[2])}
@@ -314,4 +342,5 @@ if __name__ == '__main__':
     loop.create_task(start_web_server())
     bot_client.start(bot_token=BOT_TOKEN)
     bot_client.run_until_disconnected()
-            
+
+
